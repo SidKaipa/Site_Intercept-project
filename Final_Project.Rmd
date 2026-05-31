@@ -1,0 +1,84 @@
+1. Predicting CAD presence using the clinical predictors in the data set, with random intercepts accounting for the 4 sites where the data is from
+```{r}
+library(tidyverse)
+library(haven)
+
+col_names <- c("age","sex","cp","trestbps","chol","fbs","restecg","thalach","exang","oldpeak","slope","ca","thal","num") #defining column names manually, bc the raw files have no header row
+
+#read each file and assign the variable names to the files. na="?" tells R to treat "?" as missing, which is then encoded as NA. mutate is adding a site label 
+cleveland <- read_csv("/Users/roopadilip/desktop/UCSF_projects/Spring/Biostat209/Final_Project/cleveland.data", col_names = col_names, na = "?") |> mutate(site="cleveland")
+
+switzerland <- read_csv("/Users/roopadilip/desktop/UCSF_projects/Spring/Biostat209/Final_Project/switzerland.data", col_names = col_names, na = "?") |> mutate(site="switzerland")
+
+hungary <- read_csv("/Users/roopadilip/desktop/UCSF_projects/Spring/Biostat209/Final_Project/hungarian.data", col_names = col_names, na = "?") |> mutate(site="hungary")
+
+va <- read_csv("/Users/roopadilip/desktop/UCSF_projects/Spring/Biostat209/Final_Project/va.data", col_names = col_names, na = "?") |> mutate(site="va")
+```
+
+2.combining the four datasets into one
+```{r}
+heart_data <- bind_rows(cleveland, switzerland, hungary, va) |> mutate(target = as.integer(num>0), site = as.factor(site)) #stacks all 4 site dataframes into one, so that we can model site level variation with a random intercept - essentially accounting for baseline differences among the sites. Target column recodes num(0-4 severity) into binary 1 = any CAD and 0 = none. Site is converted into a factor and is thus treated as a grouping variable
+```
+
+3. check for missing values
+```{r}
+colSums(is.na(heart_data)) #count of missing values per variable, and allows us to see which variables need to be imputed. Missingness is heavilyy concentrated in non Cleveland sites.
+heart_data |>
+  group_by(site) |>
+  summarise(across(where(is.numeric), ~ sum(is.na(.))))
+```
+
+4. imputation
+```{r}
+library(mice) #implements multiple imputation
+heart_imp <- heart_data |> select(-num) #remove num before imputation because target is already the recoded version
+heart <- mice(heart_imp, m = 20, method = "pmm", seed = 42, printFlag = FALSE) #creates 20 imputed datasets as it covers the 50-66 percent missingness in ca and thal, pmm is predictive mean matching and is used because it preserves the marginal distributions of variables, handles both continuous and count variables, and avoids out of range imputed values
+plot(heart) #trace plot checks the convergence of the imputation chains, want flat interleaved lines with no trends
+densityplot(heart) #overlays imputed red and observed blue distributions, so that we can see that the imputed values are plausible
+imp_long <- complete(heart, action = "long", include = TRUE) #extract all 20 imputed datasets in long format, true retains the original data as dataset 0
+imp_long <- imp_long |> mutate(ca = pmax(0, round(ca)), thal = round(thal)) #pmm occasionally produces out of range values, ca is number of vessels, so negative vals are impossible, thal is categorical so non integers are invalid, pmax floors ca at 0, round forces integer values to work for both
+imp <- as.mids(imp_long) #converts back to mids object so we can use mice's with and pool functions, with fits model on each imputed dataset, pool combines using rubins rules
+```
+
+
+5. model
+```{r}
+models <- with(imp, glmer(target ~ age + sex + cp + trestbps + chol + fbs + restecg + thalach + exang + oldpeak + slope + ca + thal + (1|site), family = binomial, control = glmerControl(optimizer = "bobyqa"))) #fit mixed effects logistic regression on all 20 imputed datasets using with(), glmer is chosen over glm bc patients are clustered within sites, ignoring this would underestimate standard errors, (1|site) adds a random intercept for site, allowing each instituion to have its own baseline CAD rate while sharing the same covariate effects, bobyqa optimizer is more stable than the default for binary outcomes with small number of random effect levels (4 sites)
+pooled <- pool(models) #combines istimates across 20 imputed data sets, properly accounting for both within-imputation and between-imputation variance, giving wider and more honest CI
+summary(pooled)
+```
+
+6. comparison model
+```{r}
+models_comp <- with(imp, glm(target ~ age + sex + cp + trestbps + chol + fbs + restecg + thalach + exang + oldpeak + slope + ca + thal, family = binomial)) #standard logistic regression without random effects for sites. This is a comparison model to assess whether the random intercept for site improves the model beyond what the clinical predictors already capture
+pooled_comp <- pool(models_comp) #pool results just like the main model
+summary(pooled_comp)
+```
+
+7. Cross Validation and AUC values
+```{r}
+full_data = complete(imp, 1) #gets one completely imputed dataset for cross validation, before the CV split
+set.seed(42)
+
+folds <- createFolds(full_data$target, k = 5) #5 stratified folds, ensures each fold has roughly the same proportion of CAD cases, 5 due to the 4 sites and resulting smaller training sets, risks having fewer than 2 sites represented, which breaks the random intercept
+auc_mixed = c() #initialize empty vectors to store AUC for each fold
+auc_fixed = c()
+
+for(i in seq_along(folds)){
+    train <- full_data[-folds[[i]],] #uses all observations except those in fold i
+    test <- full_data[folds[[i]],] #fold i, held out for evaluation
+
+    fit_mixed <- glmer(target ~ age + sex + cp + trestbps + chol + fbs + restecg + thalach + exang + oldpeak + slope + ca + thal + (1|site), data = train, family = binomial, control = glmerControl(optimizer="bobyqa")) #fixed mixed effects model on training data only, allow.new.levels
+
+    fit_fixed <- glm(target ~ age + sex + cp + trestbps + chol + fbs + restecg + thalach + exang + oldpeak + slope + ca + thal, data = train, family = binomial) #standard logistic regression on training data for comparison
+
+    auc_mixed[i] <- auc(test$target, predict(fit_mixed, newdata = test, type = "response", allow.new.levels = TRUE))  #predict probabilities on the held out test fold, compare to true outcomes to compute AUC. allow.new.levels = TRUE  handles test folds where not all 4 sites are represented in the training data. AUC of 0.5 is no discrimination, and 1.0 is perfect discrimination
+
+    auc_fixed[i] <- auc(test$target, predict(fit_fixed, newdata = test, type = "response")) #do the same for the normal no random effects model
+
+    cat("Fold", i, "done\n")
+}
+#report mean AUC and SD across 5 folds for each model, similar AUC between mixed and fixed confirms the random intercept adds little predictive value beyond the clinical predictors
+cat("Mixed AUC: ", round(mean(auc_mixed), 3), "±", round(sd(auc_mixed), 3), "\n")
+cat("Fixed AUC: ", round(mean(auc_fixed), 3), "±", round(sd(auc_fixed), 3), "\n")
+```
